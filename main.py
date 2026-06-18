@@ -252,6 +252,15 @@ def amount_after_label(text: str, labels: List[str]) -> str:
     return ""
 
 
+def normalise_priority(value: str, subject: str = "") -> str:
+    """Return a sensible priority or blank. Avoid bad captures like 'Centre'."""
+    combined = f"{subject}\n{value}"
+    match = re.search(r"\b(P[1-5]\s*(?:Critical|High|Medium|Low)?|Critical|High|Medium|Low)\b", combined, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return clean_text(match.group(1))
+
+
 def extract_work_order_fields(anchor_filename: str, anchor_text: str, email_body: str, subject: str) -> Dict[str, str]:
     combined = "\n".join([subject, email_body, anchor_filename, anchor_text])
 
@@ -268,9 +277,10 @@ def extract_work_order_fields(anchor_filename: str, anchor_text: str, email_body
         r"PO\s*([0-9]{5,})",
     ], "UNKNOWN")
 
-    priority = first_match(combined, [
+    priority_raw = first_match(combined, [
         r"Priority\s*[:#]?\s*([^\n\r]+)",
     ], "")
+    priority = normalise_priority(priority_raw, subject)
 
     job_spend = first_match(combined, [
         r"Job\s*Spend\s*[:#]?\s*\$?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
@@ -292,6 +302,8 @@ def extract_work_order_fields(anchor_filename: str, anchor_text: str, email_body
     service_category = first_match(combined, [
         r"Service\s*Category\s*[:#]?\s*([^\n\r]+)",
     ], "")
+    if service_category.lower().startswith("issue") or len(service_category) > 60:
+        service_category = ""
 
     description = first_match(anchor_text, [
         r"Issue\s*[:#]?\s*(.*?)(?:\n\s*Service\s*Category|\n\s*Approved|\n\s*Required|$)",
@@ -356,9 +368,9 @@ def normalize_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip()).lower()
 
 
-def load_contact_map(path: str = "contacts.csv") -> Dict[str, str]:
-    """Optional CSV lookup: name,email. Returns normalized name -> email."""
-    contacts: Dict[str, str] = {}
+def load_contact_map(path: str = "contacts.csv") -> Dict[str, Dict[str, str]]:
+    """Optional CSV lookup: name,email. Returns normalized name -> {name,email}."""
+    contacts: Dict[str, Dict[str, str]] = {}
     if not os.path.exists(path):
         return contacts
 
@@ -366,10 +378,11 @@ def load_contact_map(path: str = "contacts.csv") -> Dict[str, str]:
         with open(path, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                name = normalize_name(row.get("name", ""))
+                display_name = clean_text(row.get("name", ""))
+                name = normalize_name(display_name)
                 email = (row.get("email", "") or "").strip()
                 if name and email:
-                    contacts[name] = email
+                    contacts[name] = {"name": display_name, "email": email}
     except Exception as exc:
         print(f"Could not read contacts.csv: {exc}")
     return contacts
@@ -394,6 +407,17 @@ def extract_g8_sender_name(email_body: str) -> str:
                 return candidate
 
     return ""
+
+
+def find_contact_from_body(email_body: str, contacts: Dict[str, Dict[str, str]]) -> Tuple[str, str]:
+    """Fallback: search the whole cleaned body for any known G8 sender name."""
+    body_norm = normalize_name(email_body)
+    # Longest names first avoids matching "Carly" before "Carly Strath".
+    for name_key in sorted(contacts.keys(), key=len, reverse=True):
+        if name_key and name_key in body_norm:
+            item = contacts[name_key]
+            return item["name"], item["email"]
+    return "", ""
 
 
 def format_reporting_email(reporting_email: str, contact_name: str = "", contact_email: str = "") -> str:
@@ -503,9 +527,21 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
     reporting_source = env("REPORTING_EMAIL_SOURCE", "from").strip().lower()
     reporting_email = reply_to if reporting_source == "reply_to" and reply_to else from_email
 
-    contact_name = extract_g8_sender_name(email_body)
     contacts = load_contact_map()
-    contact_email = contacts.get(normalize_name(contact_name), "")
+    contact_name = extract_g8_sender_name(email_body)
+    contact_item = contacts.get(normalize_name(contact_name), {}) if contact_name else {}
+    contact_email = contact_item.get("email", "")
+
+    # If the signature extraction fails, search the whole body for a known G8 sender name.
+    if not contact_email:
+        found_name, found_email = find_contact_from_body(email_body, contacts)
+        if found_email:
+            contact_name, contact_email = found_name, found_email
+
+    # If the actual From is a direct G8 address, use it as the second reporting email.
+    if not contact_email and from_email.lower().endswith("@g8education.edu.au"):
+        contact_email = from_email
+
     reporting_email_line = format_reporting_email(reporting_email, contact_name, contact_email)
 
     import_body = build_import_body(fields, original_subject, reporting_email_line, email_body)
