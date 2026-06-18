@@ -132,6 +132,12 @@ def html_to_text(html: str) -> str:
     return clean_text(text)
 
 
+
+
+def looks_like_html(text: str) -> bool:
+    return bool(re.search(r"<\s*(html|body|table|tbody|tr|td|p|span|div|br)\b", text or "", flags=re.IGNORECASE))
+
+
 def should_ignore_attachment(filename: str, mime_type: str, size: int, headers: List[Dict[str, str]]) -> bool:
     ignore_inline = env_bool("IGNORE_INLINE_IMAGES", True)
     min_real_image_size_kb = env_int("MIN_REAL_IMAGE_SIZE_KB", 50)
@@ -194,8 +200,14 @@ def extract_email_content_and_attachments(service, message: Dict) -> Tuple[str, 
                 "size": len(data),
             })
 
-    # Prefer the plain-text email body if Gmail provides one. If not, use cleaned HTML.
-    body_text = "\n\n".join(plain_chunks).strip() or "\n\n".join(html_chunks).strip()
+    # Prefer the plain-text email body if Gmail provides one.
+    # Some systems incorrectly put HTML inside text/plain, so detect and clean that too.
+    plain_text = "\n\n".join(plain_chunks).strip()
+    if looks_like_html(plain_text):
+        plain_text = html_to_text(plain_text)
+
+    html_text = "\n\n".join(html_chunks).strip()
+    body_text = plain_text or html_text
     return clean_text(body_text), attachments
 
 
@@ -214,6 +226,29 @@ def first_match(text: str, patterns: List[str], default: str = "") -> str:
         if match:
             return clean_text(match.group(1))
     return default
+
+
+
+
+def amount_after_label(text: str, labels: List[str]) -> str:
+    """Find the first currency/number amount close after a label like Job Spend or Approved Purchase Limit."""
+    if not text:
+        return ""
+    lower = text.lower()
+    for label in labels:
+        idx = lower.find(label.lower())
+        if idx == -1:
+            continue
+
+        # Look shortly after the label. This handles formats such as:
+        # Approved Purchase Limit ($) 500
+        # Approved Purchase Limit ($): 500
+        # Job Spend: 4,504.50
+        chunk = text[idx + len(label): idx + len(label) + 250]
+        match = re.search(r"\$?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", chunk)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def extract_work_order_fields(anchor_filename: str, anchor_text: str, email_body: str, subject: str) -> Dict[str, str]:
@@ -237,10 +272,13 @@ def extract_work_order_fields(anchor_filename: str, anchor_text: str, email_body
     ], "")
 
     job_spend = first_match(combined, [
-        r"Job\s*Spend\s*[:#]?\s*\$?\s*([0-9,]+(?:\.[0-9]{2})?)",
-        r"Approved\s*Purchase\s*Limit\s*\(?.*?\)?\s*[:#]?\s*\$?\s*([0-9,]+(?:\.[0-9]{2})?)",
-        r"Approved\s*Purchase\s*Limit.*?\$?\s*([0-9,]+(?:\.[0-9]{2})?)",
+        r"Job\s*Spend\s*[:#]?\s*\$?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+        r"Approved\s*Purchase\s*Limit\s*\([^\)]*\)\s*[:#]?\s*\$?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
+        r"Approved\s*Purchase\s*Limit\s*[:#]?\s*\$?\s*([0-9,]+(?:\.[0-9]{1,2})?)",
     ], "")
+
+    if not job_spend:
+        job_spend = amount_after_label(combined, ["Job Spend", "Approved Purchase Limit", "Approved Purchase Limit ($)"])
 
     site = first_match(anchor_text, [
         r"Site\s*:\s*([^\n\r]+)",
@@ -262,6 +300,8 @@ def extract_work_order_fields(anchor_filename: str, anchor_text: str, email_body
     approved_quote_number = first_match(combined, [
         r"Approved\s*Quote\s*Number.*?[:#]?\s*([A-Z0-9\-]+|False|True)",
     ], "False")
+    if approved_quote_number.strip().lower() in {"upon", "please", "n/a", "na", "none"}:
+        approved_quote_number = "False"
 
     return {
         "work_order_no": work_order_no,
