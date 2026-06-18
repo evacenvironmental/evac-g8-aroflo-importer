@@ -10,6 +10,7 @@ from email.utils import parseaddr
 from typing import Dict, List, Optional, Tuple
 
 import pdfplumber
+from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -111,6 +112,26 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+
+
+def html_to_text(html: str) -> str:
+    """Convert email HTML into readable plain text for AroFlo import body."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Remove hidden/noisy elements.
+    for tag in soup(["style", "script", "head", "title", "meta"]):
+        tag.decompose()
+
+    # Add line breaks around common block tags before extracting text.
+    for tag in soup.find_all(["p", "div", "br", "tr", "table", "li"]):
+        tag.append("\n")
+
+    text = soup.get_text("\n")
+    return clean_text(text)
+
+
 def should_ignore_attachment(filename: str, mime_type: str, size: int, headers: List[Dict[str, str]]) -> bool:
     ignore_inline = env_bool("IGNORE_INLINE_IMAGES", True)
     min_real_image_size_kb = env_int("MIN_REAL_IMAGE_SIZE_KB", 50)
@@ -136,7 +157,8 @@ def should_ignore_attachment(filename: str, mime_type: str, size: int, headers: 
 
 def extract_email_content_and_attachments(service, message: Dict) -> Tuple[str, List[Dict]]:
     payload = message.get("payload", {})
-    body_chunks = []
+    plain_chunks = []
+    html_chunks = []
     attachments = []
 
     for part in walk_parts(payload):
@@ -145,8 +167,11 @@ def extract_email_content_and_attachments(service, message: Dict) -> Tuple[str, 
         body = part.get("body", {}) or {}
         headers = part.get("headers", []) or []
 
-        if mime_type in {"text/plain", "text/html"} and body.get("data"):
-            body_chunks.append(decode_body_data(body.get("data", "")))
+        if mime_type == "text/plain" and body.get("data"):
+            plain_chunks.append(decode_body_data(body.get("data", "")))
+
+        elif mime_type == "text/html" and body.get("data"):
+            html_chunks.append(html_to_text(decode_body_data(body.get("data", ""))))
 
         attachment_id = body.get("attachmentId")
         if filename and attachment_id:
@@ -169,7 +194,9 @@ def extract_email_content_and_attachments(service, message: Dict) -> Tuple[str, 
                 "size": len(data),
             })
 
-    return clean_text("\n\n".join(body_chunks)), attachments
+    # Prefer the plain-text email body if Gmail provides one. If not, use cleaned HTML.
+    body_text = "\n\n".join(plain_chunks).strip() or "\n\n".join(html_chunks).strip()
+    return clean_text(body_text), attachments
 
 
 def pdf_text(data: bytes) -> str:
