@@ -277,17 +277,28 @@ def extract_work_order_fields(anchor_filename: str, anchor_text: str, email_body
 
 
 def find_anchor_pdf(attachments: List[Dict]) -> Tuple[Optional[Dict], str]:
-    pdfs = [a for a in attachments if a["filename"].lower().endswith(".pdf") or a["mime_type"] == "application/pdf"]
+    pdfs = [
+        a for a in attachments
+        if a["filename"].lower().endswith(".pdf") or a["mime_type"] == "application/pdf"
+    ]
 
+    # Best case: the PDF filename contains the G8 task pattern.
     for pdf in pdfs:
         if re.search(r"G8\s*Ed\s*Task\s*JN", pdf["filename"], flags=re.IGNORECASE):
             text = pdf_text(pdf["data"])
             return pdf, text
 
+    # Next best case: the PDF text clearly looks like a G8 work order.
     for pdf in pdfs:
         text = pdf_text(pdf["data"])
         if "G8 Education Work Order" in text or re.search(r"Work\s*Order\s*No", text, flags=re.IGNORECASE):
             return pdf, text
+
+    # Fallback: if there is any PDF at all, use the first PDF.
+    # Some G8 PDFs are image/scanned or have filenames that differ from the expected pattern.
+    if pdfs:
+        print(f"No exact G8 anchor match. Falling back to first PDF: {pdfs[0]['filename']}")
+        return pdfs[0], pdf_text(pdfs[0]["data"])
 
     return None, ""
 
@@ -375,9 +386,13 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
     if not attachments:
         raise RuntimeError("No usable attachments found")
 
+    print(f"Usable attachments found ({len(attachments)}):")
+    for att in attachments:
+        print(f"  - {att['filename']} ({att['mime_type']}, {att['size']} bytes)")
+
     anchor_pdf, anchor_text = find_anchor_pdf(attachments)
     if not anchor_pdf:
-        raise RuntimeError("No G8 anchor PDF found")
+        raise RuntimeError("No PDF attachment found to use as anchor")
 
     print(f"Anchor PDF found: {anchor_pdf['filename']}")
 
