@@ -1,5 +1,6 @@
 
 import base64
+import csv
 import io
 import mimetypes
 import os
@@ -292,10 +293,16 @@ def extract_work_order_fields(anchor_filename: str, anchor_text: str, email_body
         r"Service\s*Category\s*[:#]?\s*([^\n\r]+)",
     ], "")
 
-    description = first_match(combined, [
-        r"Description\s*[:#]?\s*(.*?)(?:Approved Quote Number|Email body to accept|$)",
-        r"Issue\s*[:#]?\s*([^\n\r]+)",
+    description = first_match(anchor_text, [
+        r"Issue\s*[:#]?\s*(.*?)(?:\n\s*Service\s*Category|\n\s*Approved|\n\s*Required|$)",
+        r"Issue\s+([^\n\r]+)",
     ], "")
+
+    if not description:
+        description = first_match(combined, [
+            r"Issue\s*[:#]?\s*([^\n\r]+)",
+            r"Description\s*[:#]?\s*(.*?)(?:\n\s*Service\s*Category|Approved Quote Number|Email body to accept|$)",
+        ], "")
 
     approved_quote_number = first_match(combined, [
         r"Approved\s*Quote\s*Number.*?[:#]?\s*([A-Z0-9\-]+|False|True)",
@@ -343,24 +350,79 @@ def find_anchor_pdf(attachments: List[Dict]) -> Tuple[Optional[Dict], str]:
     return None, ""
 
 
-def build_import_body(fields: Dict[str, str], original_subject: str, from_email: str, reply_to: str, email_body: str) -> str:
+
+
+def normalize_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip()).lower()
+
+
+def load_contact_map(path: str = "contacts.csv") -> Dict[str, str]:
+    """Optional CSV lookup: name,email. Returns normalized name -> email."""
+    contacts: Dict[str, str] = {}
+    if not os.path.exists(path):
+        return contacts
+
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = normalize_name(row.get("name", ""))
+                email = (row.get("email", "") or "").strip()
+                if name and email:
+                    contacts[name] = email
+    except Exception as exc:
+        print(f"Could not read contacts.csv: {exc}")
+    return contacts
+
+
+def extract_g8_sender_name(email_body: str) -> str:
+    """Extract the person signing the G8 email, usually after 'Kind Regards'."""
+    if not email_body:
+        return ""
+
+    patterns = [
+        r"Kind\s+Regards,?\s*\n+\s*([A-Z][A-Za-z'\\-]+(?:\\s+[A-Z][A-Za-z'\\-]+){1,3})",
+        r"Regards,?\s*\n+\s*([A-Z][A-Za-z'\\-]+(?:\\s+[A-Z][A-Za-z'\\-]+){1,3})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, email_body, flags=re.IGNORECASE)
+        if match:
+            candidate = clean_text(match.group(1))
+            # Avoid accidentally returning job titles.
+            if not re.search(r"Facilities|Manager|Coordinator|G8", candidate, flags=re.IGNORECASE):
+                return candidate
+
+    return ""
+
+
+def format_reporting_email(reporting_email: str, contact_name: str = "", contact_email: str = "") -> str:
+    # AroFlo import needs: Reporting Email: inboundemail, G8 person email
+    # If we do not have the mapped G8 email, fall back to the detected name for review.
+    if contact_email:
+        return f"{reporting_email}, {contact_email}"
+    if contact_name:
+        return f"{reporting_email}, {contact_name}"
+    return reporting_email
+
+
+def build_import_body(fields: Dict[str, str], original_subject: str, reporting_email_line: str, email_body: str) -> str:
     timestamp = datetime.now(timezone.utc).isoformat()
 
     description = fields.get("description") or ""
     if fields.get("service_category") and fields["service_category"].lower() not in description.lower():
         description = f"Service Category: {fields['service_category']}\n{description}".strip()
 
-    return f"""Import: {fields.get("work_order_no", "UNKNOWN")} PO {fields.get("po_number", "UNKNOWN")}
+    return f"""Import: {fields.get("work_order_no", "UNKNOWN")} {fields.get("po_number", "UNKNOWN")}
 
 Imported as of {timestamp}
 
 Subject: {original_subject}
 
-CUST ON: {fields.get("work_order_no", "UNKNOWN")} PO {fields.get("po_number", "UNKNOWN")}
+CUST ON: {fields.get("work_order_no", "UNKNOWN")} {fields.get("po_number", "UNKNOWN")}
 Priority: {fields.get("priority", "")}
 Job Spend: {fields.get("job_spend", "")}
-Reporting Email: {from_email}
-Reply-To Email: {reply_to}
+Reporting Email: {reporting_email_line}
 
 Description:
 {description}
@@ -441,14 +503,21 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
     reporting_source = env("REPORTING_EMAIL_SOURCE", "from").strip().lower()
     reporting_email = reply_to if reporting_source == "reply_to" and reply_to else from_email
 
-    import_body = build_import_body(fields, original_subject, reporting_email, reply_to, email_body)
-    import_subject = f"Import: {fields.get('work_order_no', 'UNKNOWN')} PO {fields.get('po_number', 'UNKNOWN')}"
+    contact_name = extract_g8_sender_name(email_body)
+    contacts = load_contact_map()
+    contact_email = contacts.get(normalize_name(contact_name), "")
+    reporting_email_line = format_reporting_email(reporting_email, contact_name, contact_email)
+
+    import_body = build_import_body(fields, original_subject, reporting_email_line, email_body)
+    import_subject = f"Import: {fields.get('work_order_no', 'UNKNOWN')} {fields.get('po_number', 'UNKNOWN')}"
 
     print("Extracted:")
     print(f"  Work Order: {fields.get('work_order_no')}")
     print(f"  PO: {fields.get('po_number')}")
     print(f"  Priority: {fields.get('priority')}")
     print(f"  Attachments: {[a['filename'] for a in attachments]}")
+    if contact_name:
+        print(f"  G8 Contact: {contact_name}{' - ' + contact_email if contact_email else ''}")
 
     if dry_run:
         print("DRY_RUN=true: not sending to AroFlo and not changing labels.")
