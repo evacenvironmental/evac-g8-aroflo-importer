@@ -18,6 +18,9 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
+APP_VERSION = "v10-contact-match-and-queue-fix-2026-07-10"
+
+
 def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
     value = os.getenv(name, default)
     if required and not value:
@@ -212,6 +215,42 @@ def extract_email_content_and_attachments(service, message: Dict) -> Tuple[str, 
     return clean_text(body_text), attachments
 
 
+
+def attachment_key(att: Dict) -> Tuple[str, int, bytes]:
+    """Best-effort attachment dedupe key for thread fallback."""
+    return (
+        (att.get("filename") or "").lower(),
+        int(att.get("size") or 0),
+        (att.get("data") or b"")[:32],
+    )
+
+
+def extract_thread_content_and_attachments(service, thread_id: str, preferred_body: str = "") -> Tuple[str, List[Dict]]:
+    """Fallback for Gmail conversations: collect usable attachments from every message in the thread.
+
+    Gmail labels can be conversation-level. Sometimes the labelled message is a forward/reply
+    with no attachments while the G8 PDF sits on another message in the same thread. This
+    prevents a no-attachment message from blocking the queue.
+    """
+    thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    body_text = preferred_body or ""
+    attachments: List[Dict] = []
+    seen = set()
+
+    for thread_msg in thread.get("messages", []) or []:
+        msg_body, msg_attachments = extract_email_content_and_attachments(service, thread_msg)
+        if not body_text and msg_body:
+            body_text = msg_body
+        for att in msg_attachments:
+            key = attachment_key(att)
+            if key in seen:
+                continue
+            seen.add(key)
+            attachments.append(att)
+
+    return clean_text(body_text), attachments
+
+
 def pdf_text(data: bytes) -> str:
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
@@ -365,13 +404,29 @@ def find_anchor_pdf(attachments: List[Dict]) -> Tuple[Optional[Dict], str]:
 
 
 def normalize_name(name: str) -> str:
-    return re.sub(r"\s+", " ", (name or "").strip()).lower()
+    """Normalize names for fuzzy G8 contact matching.
+
+    Handles variants like:
+    - Jade Hawkearandale
+    - Jade Hawke-Arandale
+    - Jade Hawke Arandale
+    """
+    value = (name or "").strip().lower()
+    value = re.sub(r"[<>\(\)\[\],;:\"']", " ", value)
+    value = value.replace("-", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def compact_name_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", normalize_name(name))
 
 
 def load_contact_map(path: str = "contacts.csv") -> Dict[str, Dict[str, str]]:
     """Optional CSV lookup: name,email. Returns normalized name -> {name,email}."""
     contacts: Dict[str, Dict[str, str]] = {}
     if not os.path.exists(path):
+        print("contacts.csv not found; G8 sender email matching disabled")
         return contacts
 
     try:
@@ -385,6 +440,9 @@ def load_contact_map(path: str = "contacts.csv") -> Dict[str, Dict[str, str]]:
                     contacts[name] = {"name": display_name, "email": email}
     except Exception as exc:
         print(f"Could not read contacts.csv: {exc}")
+    if contacts:
+        unique_emails = sorted({item["email"].lower() for item in contacts.values()})
+        print(f"Loaded contacts.csv: {len(unique_emails)} contact email(s), {len(contacts)} name/alias key(s)")
     return contacts
 
 
@@ -409,13 +467,24 @@ def extract_g8_sender_name(email_body: str) -> str:
     return ""
 
 
-def find_contact_from_body(email_body: str, contacts: Dict[str, Dict[str, str]]) -> Tuple[str, str]:
-    """Fallback: search the whole cleaned body for any known G8 sender name."""
-    body_norm = normalize_name(email_body)
+def find_contact_from_text(text: str, contacts: Dict[str, Dict[str, str]]) -> Tuple[str, str]:
+    """Fallback: search text for any known G8 sender name.
+
+    Uses both spaced and compact matching so Jade Hawke-Arandale can match
+    Jade Hawke Arandale / Jade Hawkearandale aliases in contacts.csv.
+    """
+    text_norm = normalize_name(text)
+    text_compact = compact_name_key(text)
+
     # Longest names first avoids matching "Carly" before "Carly Strath".
     for name_key in sorted(contacts.keys(), key=len, reverse=True):
-        if name_key and name_key in body_norm:
-            item = contacts[name_key]
+        if not name_key:
+            continue
+        item = contacts[name_key]
+        if name_key in text_norm:
+            return item["name"], item["email"]
+        compact_key = compact_name_key(name_key)
+        if compact_key and compact_key in text_compact:
             return item["name"], item["email"]
     return "", ""
 
@@ -491,19 +560,33 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
         label_ids["failed"],
     }):
         print(f"Skipping already handled email: {message_id}")
-        return
+        # Prevent already-handled emails from clogging the active queue forever.
+        if not dry_run and label_ids["input"] in existing_labels:
+            modify_labels(service, message_id, add=[], remove=[label_ids["input"]])
+            print("Removed input label from already handled email")
+        return "skipped"
 
     headers = message.get("payload", {}).get("headers", [])
     original_subject = get_header(headers, "Subject")
     raw_from = get_header(headers, "From")
     raw_reply_to = get_header(headers, "Reply-To")
-    from_email = parseaddr(raw_from)[1] or raw_from
+    from_name, parsed_from_email = parseaddr(raw_from)
+    from_email = parsed_from_email or raw_from
     reply_to = parseaddr(raw_reply_to)[1] or ""
 
     print(f"Processing email: {original_subject}")
     print(f"From: {from_email}")
+    if from_name:
+        print(f"From name: {from_name}")
 
     email_body, attachments = extract_email_content_and_attachments(service, message)
+
+    if not attachments and message.get("threadId"):
+        print("No usable attachments on selected message; checking full Gmail thread...")
+        email_body, attachments = extract_thread_content_and_attachments(
+            service, message["threadId"], preferred_body=email_body
+        )
+
     max_attachments = env_int("MAX_ATTACHMENTS_PER_EMAIL", 10)
 
     if len(attachments) > max_attachments:
@@ -528,13 +611,25 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
     reporting_email = reply_to if reporting_source == "reply_to" and reply_to else from_email
 
     contacts = load_contact_map()
+
+    # Contact matching order:
+    # 1. Signature name after Kind Regards / Regards
+    # 2. Gmail From display name, e.g. "Chiari Yamasaki"
+    # 3. Whole email body, including forwarded headers like "From: Jade Hawke-Arandale <...>"
+    # 4. Raw From / Reply-To headers
+    # 5. Direct @g8education.edu.au From address
     contact_name = extract_g8_sender_name(email_body)
     contact_item = contacts.get(normalize_name(contact_name), {}) if contact_name else {}
     contact_email = contact_item.get("email", "")
 
-    # If the signature extraction fails, search the whole body for a known G8 sender name.
+    if not contact_email and from_name:
+        found_name, found_email = find_contact_from_text(from_name, contacts)
+        if found_email:
+            contact_name, contact_email = found_name, found_email
+
     if not contact_email:
-        found_name, found_email = find_contact_from_body(email_body, contacts)
+        lookup_text = "\n".join([raw_from, raw_reply_to, original_subject, email_body])
+        found_name, found_email = find_contact_from_text(lookup_text, contacts)
         if found_email:
             contact_name, contact_email = found_name, found_email
 
@@ -560,7 +655,7 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
         print("----- AROFLO BODY PREVIEW -----")
         print(import_body[:4000])
         print("----- END PREVIEW -----")
-        return
+        return "dry_run"
 
     aroflo_import_email = env("AROFLO_IMPORT_EMAIL", required=True)
     send_from_email = env("SEND_FROM_EMAIL", required=True)
@@ -577,6 +672,7 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
 
     modify_labels(service, message_id, add=[label_ids["processed"]], remove=[label_ids["input"]])
     print("Marked email as processed")
+    return "processed"
 
 
 def main():
@@ -584,6 +680,7 @@ def main():
     max_emails = env_int("MAX_EMAILS_PER_RUN", 5)
 
     print("Starting EVAC G8 AroFlo importer")
+    print(f"APP_VERSION={APP_VERSION}")
     print(f"DRY_RUN={dry_run}")
 
     service = get_gmail_service()
@@ -600,26 +697,68 @@ def main():
         "failed": ensure_label(service, failed_label_name),
     }
 
+    search_limit = env_int("GMAIL_SEARCH_LIMIT", max(max_emails * 5, 20))
     response = service.users().messages().list(
         userId="me",
         labelIds=[label_ids["input"]],
-        maxResults=max_emails,
+        maxResults=search_limit,
     ).execute()
 
     messages = response.get("messages", [])
-    print(f"Found {len(messages)} email(s) under label {input_label_name}")
+    print(f"Found {len(messages)} candidate email(s) under label {input_label_name}")
+    print(f"Will attempt up to {max_emails} pending email(s); scanning up to {search_limit} candidate(s)")
 
+    # Process oldest first. Gmail normally returns newest first, which can let a newer
+    # broken email block older valid emails when MAX_EMAILS_PER_RUN is low.
+    dated_messages = []
     for item in messages:
+        try:
+            meta = service.users().messages().get(
+                userId="me",
+                id=item["id"],
+                format="metadata",
+                metadataHeaders=["Subject"],
+            ).execute()
+            dated_messages.append((int(meta.get("internalDate", "0")), item))
+        except Exception as meta_exc:
+            print(f"Could not read message metadata for {item['id']}: {meta_exc}")
+            dated_messages.append((0, item))
+
+    dated_messages.sort(key=lambda pair: pair[0])
+
+    attempted = 0
+    skipped = 0
+    errors = 0
+
+    for _, item in dated_messages:
+        if attempted >= max_emails:
+            break
+
         message_id = item["id"]
         try:
-            process_message(service, message_id, label_ids, dry_run)
+            result = process_message(service, message_id, label_ids, dry_run)
+            if result == "skipped":
+                skipped += 1
+                continue
+            attempted += 1
         except Exception as exc:
+            attempted += 1
+            errors += 1
             print(f"ERROR processing message {message_id}: {exc}")
             if not dry_run:
                 try:
-                    modify_labels(service, message_id, add=[label_ids["review"]], remove=[])
+                    # A failed email must leave the active queue so it cannot block later jobs.
+                    modify_labels(
+                        service,
+                        message_id,
+                        add=[label_ids["review"]],
+                        remove=[label_ids["input"]],
+                    )
+                    print("Marked email as Needs Review and removed it from active queue")
                 except Exception as label_exc:
-                    print(f"Could not apply review label: {label_exc}")
+                    print(f"Could not apply review label/remove input label: {label_exc}")
+
+    print(f"Run summary: attempted={attempted}, skipped_already_handled={skipped}, errors={errors}")
 
 
 if __name__ == "__main__":
