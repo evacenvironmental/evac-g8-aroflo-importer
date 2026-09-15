@@ -17,7 +17,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
-APP_VERSION = "v12-inbound-picker-2026-09-15"
+APP_VERSION = "v13-description-fix-2026-09-15"
 
 
 def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
@@ -343,15 +343,30 @@ def extract_work_order_fields(anchor_filename: str, anchor_text: str, email_body
     if service_category.lower().startswith("issue") or len(service_category) > 60:
         service_category = ""
 
+    # Always read the description from the "Description:" label. G8 work orders do
+    # not reliably carry an "Issue:" label, and matching on "Issue" also false-matches
+    # the "Issued to:" field near the top of the PDF.
+    # The label shares its line with "Service Category:", so skip the rest of that
+    # line and capture from the next line until the next form field.
+    description_end = (
+        r"(?=\n\s*Approved\s*Purchase\s*Limit"
+        r"|\n\s*PO\s*Number"
+        r"|\n\s*Quote\s*Number"
+        r"|\n\s*Department\s*Notification"
+        r"|\n\s*Additional\s*Information"
+        r"|\n\s*Required\s*actions"
+        r"|\Z)"
+    )
+
     description = first_match(anchor_text, [
-        r"Issue\s*[:#]?\s*(.*?)(?:\n\s*Service\s*Category|\n\s*Approved|\n\s*Required|$)",
-        r"Issue\s+([^\n\r]+)",
+        r"Description\s*[:#]\s*(?:Service\s*Category\s*[:#][^\n]*)?\n(.*?)" + description_end,
+        r"Description\s*[:#]\s*(?:Service\s*Category\s*[:#][^\n]*)?\n(.+)",
     ], "")
 
     if not description:
         description = first_match(combined, [
-            r"Issue\s*[:#]?\s*([^\n\r]+)",
-            r"Description\s*[:#]?\s*(.*?)(?:\n\s*Service\s*Category|Approved Quote Number|Email body to accept|$)",
+            r"Description\s*[:#]\s*(?:Service\s*Category\s*[:#][^\n]*)?\n(.*?)" + description_end,
+            r"Description\s*[:#]\s*([^\n\r]+)",
         ], "")
 
     approved_quote_number = first_match(combined, [
