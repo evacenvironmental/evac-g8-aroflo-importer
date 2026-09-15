@@ -17,7 +17,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
-APP_VERSION = "v11-reply-to-reporting-2026-09-15"
+APP_VERSION = "v12-inbound-picker-2026-09-15"
 
 
 def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
@@ -489,11 +489,7 @@ def find_contact_from_text(text: str, contacts: Dict[str, Dict[str, str]]) -> Tu
 
 
 def dedupe_emails(values: List[str]) -> List[str]:
-    """Drop blanks and case-insensitive repeats, keeping the original order.
-
-    From and Reply-To are the same address on senders whose mail setup has not
-    changed, so the inbound slot must not list one address twice.
-    """
+    """Drop blanks and case-insensitive repeats, keeping the original order."""
     seen = set()
     result = []
     for value in values:
@@ -508,15 +504,39 @@ def dedupe_emails(values: List[str]) -> List[str]:
     return result
 
 
-def format_reporting_email(inbound_emails: List[str], contact_name: str = "", contact_email: str = "") -> str:
-    # AroFlo import needs: Reporting Email: inbound address(es), G8 person email
+def pick_inbound_email(reply_to: str, from_email: str) -> str:
+    """Slot 1 of the AroFlo reporting line: the AroFlo inbound address.
+
+    G8 moved this address into Reply-To, but not every sender looks to have
+    changed over, so read both headers and take whichever one is actually the
+    AroFlo inbound. Only ever returns one address.
+    """
+    marker = env("AROFLO_INBOUND_MATCH", "aroflo").strip().lower()
+    candidates = dedupe_emails([reply_to, from_email])
+
+    if not candidates:
+        return ""
+
+    if marker:
+        for candidate in candidates:
+            if marker in candidate.lower():
+                return candidate
+        print(
+            f"Neither Reply-To nor From contains '{marker}'; "
+            f"defaulting to {candidates[0]}"
+        )
+
+    return candidates[0]
+
+
+def format_reporting_email(reporting_email: str, contact_name: str = "", contact_email: str = "") -> str:
+    # AroFlo import needs: Reporting Email: inboundemail, G8 person email
     # If we do not have the mapped G8 email, fall back to the detected name for review.
-    parts = dedupe_emails(list(inbound_emails) + [contact_email])
     if contact_email:
-        return ", ".join(parts)
+        return f"{reporting_email}, {contact_email}"
     if contact_name:
-        return ", ".join(parts + [contact_name])
-    return ", ".join(parts)
+        return f"{reporting_email}, {contact_name}"
+    return reporting_email
 
 
 def build_import_body(fields: Dict[str, str], original_subject: str, reporting_email_line: str, email_body: str) -> str:
@@ -634,21 +654,19 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
 
     fields = extract_work_order_fields(anchor_pdf["filename"], anchor_text, email_body, original_subject)
 
-    # Slot 1 of the AroFlo reporting line is the inbound address. G8 changed their
-    # mail setup so the address now arrives in Reply-To, but not every sender looks
-    # to have moved, so capture both and let dedupe_emails collapse them when they match.
-    # REPORTING_EMAIL_SOURCE: both (default) | reply_to | from
-    reporting_source = env("REPORTING_EMAIL_SOURCE", "both").strip().lower()
+    # Slot 1 of the AroFlo reporting line is the AroFlo inbound address. G8 moved it
+    # into Reply-To, but not every sender looks to have changed over, so check both
+    # headers and take whichever one is the inbound. Still one address, not two.
+    # REPORTING_EMAIL_SOURCE: auto (default) | reply_to | from
+    reporting_source = env("REPORTING_EMAIL_SOURCE", "auto").strip().lower()
     if reporting_source == "from":
-        inbound_emails = dedupe_emails([from_email])
+        reporting_email = from_email
     elif reporting_source == "reply_to":
-        inbound_emails = dedupe_emails([reply_to or from_email])
+        reporting_email = reply_to or from_email
     else:
-        inbound_emails = dedupe_emails([reply_to, from_email])
+        reporting_email = pick_inbound_email(reply_to, from_email)
 
-    if not reply_to:
-        print("No Reply-To header on this email; using the From address only")
-    print(f"Inbound email(s): {', '.join(inbound_emails)}")
+    print(f"Inbound email: {reporting_email}")
 
     contacts = load_contact_map()
 
@@ -677,7 +695,7 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
     if not contact_email and from_email.lower().endswith("@g8education.edu.au"):
         contact_email = from_email
 
-    reporting_email_line = format_reporting_email(inbound_emails, contact_name, contact_email)
+    reporting_email_line = format_reporting_email(reporting_email, contact_name, contact_email)
 
     import_body = build_import_body(fields, original_subject, reporting_email_line, email_body)
     import_subject = f"Import: {fields.get('work_order_no', 'UNKNOWN')} {fields.get('po_number', 'UNKNOWN')}"
