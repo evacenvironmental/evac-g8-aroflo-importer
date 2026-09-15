@@ -1,4 +1,3 @@
-
 import base64
 import csv
 import io
@@ -18,7 +17,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
-APP_VERSION = "v10-contact-match-and-queue-fix-2026-07-10"
+APP_VERSION = "v11-reply-to-reporting-2026-09-15"
 
 
 def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
@@ -489,14 +488,35 @@ def find_contact_from_text(text: str, contacts: Dict[str, Dict[str, str]]) -> Tu
     return "", ""
 
 
-def format_reporting_email(reporting_email: str, contact_name: str = "", contact_email: str = "") -> str:
-    # AroFlo import needs: Reporting Email: inboundemail, G8 person email
+def dedupe_emails(values: List[str]) -> List[str]:
+    """Drop blanks and case-insensitive repeats, keeping the original order.
+
+    From and Reply-To are the same address on senders whose mail setup has not
+    changed, so the inbound slot must not list one address twice.
+    """
+    seen = set()
+    result = []
+    for value in values:
+        cleaned = (value or "").strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(cleaned)
+    return result
+
+
+def format_reporting_email(inbound_emails: List[str], contact_name: str = "", contact_email: str = "") -> str:
+    # AroFlo import needs: Reporting Email: inbound address(es), G8 person email
     # If we do not have the mapped G8 email, fall back to the detected name for review.
+    parts = dedupe_emails(list(inbound_emails) + [contact_email])
     if contact_email:
-        return f"{reporting_email}, {contact_email}"
+        return ", ".join(parts)
     if contact_name:
-        return f"{reporting_email}, {contact_name}"
-    return reporting_email
+        return ", ".join(parts + [contact_name])
+    return ", ".join(parts)
 
 
 def build_import_body(fields: Dict[str, str], original_subject: str, reporting_email_line: str, email_body: str) -> str:
@@ -572,12 +592,19 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
     raw_reply_to = get_header(headers, "Reply-To")
     from_name, parsed_from_email = parseaddr(raw_from)
     from_email = parsed_from_email or raw_from
-    reply_to = parseaddr(raw_reply_to)[1] or ""
+    # Reply-To display name is logged for debugging only. It is often an AroFlo
+    # generated label rather than a real person, so it never feeds contact matching.
+    reply_to_name, parsed_reply_to = parseaddr(raw_reply_to)
+    reply_to = parsed_reply_to or ""
 
     print(f"Processing email: {original_subject}")
     print(f"From: {from_email}")
     if from_name:
         print(f"From name: {from_name}")
+    if reply_to:
+        print(f"Reply-To: {reply_to}")
+    if reply_to_name:
+        print(f"Reply-To name (not used for matching): {reply_to_name}")
 
     email_body, attachments = extract_email_content_and_attachments(service, message)
 
@@ -607,8 +634,21 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
 
     fields = extract_work_order_fields(anchor_pdf["filename"], anchor_text, email_body, original_subject)
 
-    reporting_source = env("REPORTING_EMAIL_SOURCE", "from").strip().lower()
-    reporting_email = reply_to if reporting_source == "reply_to" and reply_to else from_email
+    # Slot 1 of the AroFlo reporting line is the inbound address. G8 changed their
+    # mail setup so the address now arrives in Reply-To, but not every sender looks
+    # to have moved, so capture both and let dedupe_emails collapse them when they match.
+    # REPORTING_EMAIL_SOURCE: both (default) | reply_to | from
+    reporting_source = env("REPORTING_EMAIL_SOURCE", "both").strip().lower()
+    if reporting_source == "from":
+        inbound_emails = dedupe_emails([from_email])
+    elif reporting_source == "reply_to":
+        inbound_emails = dedupe_emails([reply_to or from_email])
+    else:
+        inbound_emails = dedupe_emails([reply_to, from_email])
+
+    if not reply_to:
+        print("No Reply-To header on this email; using the From address only")
+    print(f"Inbound email(s): {', '.join(inbound_emails)}")
 
     contacts = load_contact_map()
 
@@ -637,7 +677,7 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
     if not contact_email and from_email.lower().endswith("@g8education.edu.au"):
         contact_email = from_email
 
-    reporting_email_line = format_reporting_email(reporting_email, contact_name, contact_email)
+    reporting_email_line = format_reporting_email(inbound_emails, contact_name, contact_email)
 
     import_body = build_import_body(fields, original_subject, reporting_email_line, email_body)
     import_subject = f"Import: {fields.get('work_order_no', 'UNKNOWN')} {fields.get('po_number', 'UNKNOWN')}"
