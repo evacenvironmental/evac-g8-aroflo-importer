@@ -1,3 +1,4 @@
+
 import base64
 import csv
 import io
@@ -17,7 +18,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
-APP_VERSION = "v13-description-fix-2026-09-15"
+APP_VERSION = "v14-from-replyto-fix-2026-09-16"
 
 
 def env(name: str, default: Optional[str] = None, required: bool = False) -> str:
@@ -466,8 +467,8 @@ def extract_g8_sender_name(email_body: str) -> str:
         return ""
 
     patterns = [
-        r"Kind\s+Regards,?\s*\n+\s*([A-Z][A-Za-z'\\-]+(?:\\s+[A-Z][A-Za-z'\\-]+){1,3})",
-        r"Regards,?\s*\n+\s*([A-Z][A-Za-z'\\-]+(?:\\s+[A-Z][A-Za-z'\\-]+){1,3})",
+        r"Kind\s+Regards,?\s*\n+\s*([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){1,3})",
+        r"Regards,?\s*\n+\s*([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){1,3})",
     ]
 
     for pattern in patterns:
@@ -669,19 +670,15 @@ def process_message(service, message_id: str, label_ids: Dict[str, str], dry_run
 
     fields = extract_work_order_fields(anchor_pdf["filename"], anchor_text, email_body, original_subject)
 
-    # Slot 1 of the AroFlo reporting line is the AroFlo inbound address. G8 moved it
-    # into Reply-To, but not every sender looks to have changed over, so check both
-    # headers and take whichever one is the inbound. Still one address, not two.
-    # REPORTING_EMAIL_SOURCE: auto (default) | reply_to | from
+    # Slot 1 of the AroFlo reporting line must be the AroFlo inbound address.
+    # Always inspect BOTH Reply-To and From. This deliberately ignores the old
+    # REPORTING_EMAIL_SOURCE=from setting so a Render environment variable cannot
+    # accidentally stop Reply-To from being checked.
     reporting_source = env("REPORTING_EMAIL_SOURCE", "auto").strip().lower()
-    if reporting_source == "from":
-        reporting_email = from_email
-    elif reporting_source == "reply_to":
-        reporting_email = reply_to or from_email
-    else:
-        reporting_email = pick_inbound_email(reply_to, from_email)
+    print(f"REPORTING_EMAIL_SOURCE={reporting_source} (v14 always checks both From and Reply-To)")
+    reporting_email = pick_inbound_email(reply_to, from_email)
 
-    print(f"Inbound email: {reporting_email}")
+    print(f"Inbound email selected: {reporting_email}")
 
     contacts = load_contact_map()
 
